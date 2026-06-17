@@ -1,0 +1,286 @@
+#!/usr/bin/env node
+/**
+ * mcp-shell/server.js — native Streamable HTTP MCP server for shell execution.
+ * ===========================================================================
+ * Exposes a single `execute_command` tool over the MCP Streamable HTTP
+ * transport. The command runs directly in a subprocess of this server — there
+ * is no separate gateway process and no stdio child.
+ *
+ * SECURITY — two independent layers, both mandatory by default:
+ *   1. Bearer token (env MCP_SHELL_TOKEN). The server refuses to start without
+ *      it; every HTTP request must present `Authorization: Bearer <token>` or
+ *      gets 401 — checked before any MCP session handling.
+ *   2. Default-deny command allowlist (env MCP_SHELL_ALLOWED_COMMANDS). Empty by
+ *      default => zero execution out of the box. A command runs only if its
+ *      program is explicitly allowlisted, and commands containing shell control
+ *      characters are rejected so the allowlist can't be bypassed by chaining.
+ *
+ * These are app-layer defense-in-depth on top of (not instead of) running as a
+ * least-privileged user, binding to 127.0.0.1, and network-layer access control.
+ */
+
+import express from "express";
+import { randomUUID } from "node:crypto";
+import { exec } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import {
+  createNotifier,
+  startWatchdog,
+  makeReadyRoute,
+  withTimeout,
+  selfReport,
+} from "./smart-bridge.js";
+
+export const VERSION = "1.0.0";
+export const MAX_OUTPUT_BYTES = 100 * 1024;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 300_000;
+const READY_TIMEOUT_MS = 2500;
+const READY_SHELL_TIMEOUT_MS = 1500;
+const DEFAULT_SHELL = process.env.MCP_SHELL_BIN || "/bin/bash";
+
+// Shell control characters that enable chaining / substitution / redirection.
+// When an allowlist is in force these must be rejected, otherwise an allowlisted
+// program could be used as a springboard (e.g. `echo x; rm -rf /`).
+const SHELL_METACHARS = /[;&|`$(){}<>\n\r]/;
+
+// The /healthz + /ready prefix is derived from the MCP endpoint (drop a trailing
+// /mcp) so health routes sit alongside the MCP endpoint. ROUTE_PREFIX overrides.
+export function deriveRoutePrefix(mcpEndpoint, override) {
+  return override || mcpEndpoint.replace(/\/mcp$/, "");
+}
+
+export function truncate(str, maxBytes = MAX_OUTPUT_BYTES) {
+  if (Buffer.byteLength(str, "utf-8") <= maxBytes) return str;
+  let truncated = str;
+  while (Buffer.byteLength(truncated, "utf-8") > maxBytes) {
+    truncated = truncated.slice(0, Math.floor(truncated.length * 0.9));
+  }
+  return truncated + "\n\n[OUTPUT TRUNCATED — exceeded 100KB limit]";
+}
+
+// Default-deny: returns { ok:false, reason } unless the command's program is
+// explicitly allowlisted (matched by full first token or its basename) and the
+// command is free of shell control characters.
+export function checkAllowed(command, allowlist) {
+  if (SHELL_METACHARS.test(command)) {
+    return { ok: false, reason: "command contains shell control characters (;, &, |, `, $, (), <>, …)" };
+  }
+  const program = command.trim().split(/\s+/)[0] || "";
+  const base = program.split("/").pop();
+  if (allowlist.includes(program) || allowlist.includes(base)) {
+    return { ok: true, program: base };
+  }
+  return { ok: false, reason: `'${base}' is not in the allowlist` };
+}
+
+export function runCommand(command, timeoutMs) {
+  return new Promise((resolve) => {
+    exec(
+      command,
+      { timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES * 2, shell: DEFAULT_SHELL, env: process.env },
+      (error, stdout, stderr) => {
+        const exitCode = error ? (error.code ?? 1) : 0;
+        const killed = error?.killed ?? false;
+        let stdoutStr = truncate(String(stdout || ""), MAX_OUTPUT_BYTES);
+        let stderrStr = truncate(String(stderr || ""), MAX_OUTPUT_BYTES);
+        if (killed) {
+          stderrStr += "\n\n[PROCESS KILLED — exceeded " + timeoutMs + "ms timeout]";
+        }
+        resolve({ stdout: stdoutStr, stderr: stderrStr, exitCode, killed });
+      }
+    );
+  });
+}
+
+// Readiness real-path check: spawn a throwaway shell, run a trivial command,
+// confirm exit 0 within a timeout. Proves the server can actually spawn a shell,
+// not merely that the HTTP listener is up.
+async function shellReadyCheck() {
+  const r = await runCommand("true", READY_SHELL_TIMEOUT_MS);
+  if (r.exitCode !== 0 || r.killed) {
+    throw new Error("shell ready check failed (exit " + r.exitCode + (r.killed ? ", killed" : "") + ")");
+  }
+}
+export const readyCheck = () => withTimeout(shellReadyCheck(), READY_TIMEOUT_MS, "mcp-shell /ready");
+
+export function createMcpServer(allowedCommands = []) {
+  const server = new McpServer({ name: "mcp-shell", version: VERSION });
+
+  const allowList = allowedCommands.length
+    ? "Allowlisted programs: " + allowedCommands.join(", ") + "."
+    : "No commands are allowlisted; every command will be rejected until the operator configures MCP_SHELL_ALLOWED_COMMANDS.";
+
+  server.tool(
+    "execute_command",
+    "Execute an allowlisted shell command on the host machine. Returns stdout, stderr, and exit code. " + allowList,
+    {
+      command: z.string().min(1).max(10_000).describe("The shell command to execute"),
+      timeout_ms: z.number().int().min(1000).max(MAX_TIMEOUT_MS).optional()
+        .describe("Command timeout in milliseconds. Default: 30000 (30s). Max: 300000 (5min)."),
+    },
+    async ({ command, timeout_ms }) => {
+      const verdict = checkAllowed(command, allowedCommands);
+      if (!verdict.ok) {
+        return { content: [{ type: "text", text: "Command rejected (default-deny allowlist): " + verdict.reason }], isError: true };
+      }
+      const timeout = Math.min(timeout_ms ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+      const result = await runCommand(command, timeout);
+      const output = ["Command Output:", "stdout: " + result.stdout, "stderr: " + result.stderr].join("\n");
+      return { content: [{ type: "text", text: output }], isError: result.exitCode !== 0 };
+    }
+  );
+
+  return server;
+}
+
+export function parseAllowedCommands(value) {
+  if (!value) return [];
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+export function createApp({
+  token,
+  allowedCommands = [],
+  mcpEndpoint = process.env.MCP_ENDPOINT || "/mcp",
+  routePrefix = process.env.ROUTE_PREFIX,
+} = {}) {
+  if (!token) {
+    throw new Error("mcp-shell: a bearer token is required (createApp({ token }))");
+  }
+  const MCP_ENDPOINT = mcpEndpoint;
+  const ROUTE_PREFIX = deriveRoutePrefix(MCP_ENDPOINT, routePrefix);
+  const sessions = new Map();
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+
+  app.use((_req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    next();
+  });
+
+  // Bearer auth on EVERY request (CORS preflight excepted), enforced before any
+  // session lookup => missing/invalid token is 401, not 400.
+  app.use((req, res, next) => {
+    if (req.method === "OPTIONS") return next();
+    const header = req.headers["authorization"] || "";
+    const provided = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!provided || provided !== token) {
+      return res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized: missing or invalid bearer token" },
+        id: null,
+      });
+    }
+    next();
+  });
+
+  app.options(MCP_ENDPOINT, (_req, res) => res.sendStatus(204));
+
+  app.get(`${ROUTE_PREFIX}/healthz`, (_req, res) => {
+    res.json({ status: "ok", version: VERSION, sessions: sessions.size, uptime: Math.floor(process.uptime()) });
+  });
+  app.get(`${ROUTE_PREFIX}/ready`, makeReadyRoute(readyCheck));
+
+  app.post(MCP_ENDPOINT, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+    try {
+      if (sessionId && sessions.has(sessionId)) {
+        const { transport } = sessions.get(sessionId);
+        await transport.handleRequest(req, res, req.body);
+        return;
+      }
+      if (!sessionId && req.body?.method === "initialize") {
+        const mcpServer = createMcpServer(allowedCommands);
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            sessions.set(sid, { transport, server: mcpServer });
+            console.error("[mcp-shell] Session created: " + sid);
+          },
+        });
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && sessions.has(sid)) {
+            sessions.delete(sid);
+            console.error("[mcp-shell] Session closed: " + sid);
+          }
+        };
+        await mcpServer.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+        return;
+      }
+      res.status(400).json({ jsonrpc: "2.0", error: { code: -32600, message: "Bad request: missing or invalid session" }, id: req.body?.id ?? null });
+    } catch (err) {
+      console.error("[mcp-shell] POST error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: req.body?.id ?? null });
+      }
+    }
+  });
+
+  app.get(MCP_ENDPOINT, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+    if (sessionId && sessions.has(sessionId)) {
+      const { transport } = sessions.get(sessionId);
+      await transport.handleRequest(req, res);
+      return;
+    }
+    res.status(400).json({ error: "Invalid or missing session" });
+  });
+
+  app.delete(MCP_ENDPOINT, async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"];
+    if (sessionId && sessions.has(sessionId)) {
+      const { transport, server } = sessions.get(sessionId);
+      await transport.close();
+      await server.close();
+      sessions.delete(sessionId);
+      console.error("[mcp-shell] Session deleted: " + sessionId);
+      res.sendStatus(204);
+      return;
+    }
+    res.status(404).json({ error: "Session not found" });
+  });
+
+  app.locals.mcpEndpoint = MCP_ENDPOINT;
+  app.locals.routePrefix = ROUTE_PREFIX;
+  app.locals.allowedCommands = allowedCommands;
+  return app;
+}
+
+export function start() {
+  const token = process.env.MCP_SHELL_TOKEN;
+  if (!token) {
+    console.error("[mcp-shell] FATAL: MCP_SHELL_TOKEN is not set. Refusing to start an unauthenticated shell server.");
+    process.exit(1);
+  }
+  const allowedCommands = parseAllowedCommands(process.env.MCP_SHELL_ALLOWED_COMMANDS);
+  if (allowedCommands.length === 0) {
+    console.error("[mcp-shell] WARNING: MCP_SHELL_ALLOWED_COMMANDS is empty — default-deny is in effect, every command will be rejected.");
+  }
+
+  const PORT = parseInt(process.env.PORT || "3000", 10);
+  const HOST = process.env.HOST || "127.0.0.1";
+  const app = createApp({ token, allowedCommands });
+
+  const notifier = createNotifier({ selfReport });
+
+  return app.listen(PORT, HOST, () => {
+    console.error("[mcp-shell] v" + VERSION + " listening on " + HOST + ":" + PORT + app.locals.mcpEndpoint +
+      " (allowlist: " + (allowedCommands.join(", ") || "<empty — default-deny>") + ")");
+    startWatchdog({ notifier, readyCheck, intervalMs: 15_000 });
+  });
+}
+
+// Auto-start only when run directly (`node server.js`), not when imported.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  start();
+}

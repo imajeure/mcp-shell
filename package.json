@@ -1,0 +1,50 @@
+{
+  "name": "@imajeure/mcp-shell",
+  "version": "0.1.0",
+  "description": "Native Streamable HTTP MCP server exposing a single execute_command shell tool, with a /ready readiness probe and systemd watchdog support.",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "mcp-shell": "server.js"
+  },
+  "files": [
+    "server.js",
+    "smart-bridge.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "shell",
+    "execute-command",
+    "http",
+    "streamable-http",
+    "systemd"
+  ],
+  "license": "Apache-2.0",
+  "author": "Imajeure, Inc. <oss@imajeure.com>",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.1.0",
+    "zod": "^3.24.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imajeure/mcp-shell.git"
+  },
+  "homepage": "https://github.com/imajeure/mcp-shell#readme",
+  "bugs": {
+    "url": "https://github.com/imajeure/mcp-shell/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
