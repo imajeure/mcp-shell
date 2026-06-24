@@ -1,6 +1,6 @@
 # mcp-shell
 
-[![npm](https://img.shields.io/npm/v/@imajeure/mcp-shell.svg)](https://www.npmjs.com/package/@imajeure/mcp-shell) ![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg) ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
+[![CI](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml/badge.svg)](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@imajeure/mcp-shell.svg)](https://www.npmjs.com/package/@imajeure/mcp-shell) ![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg) ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 
 A native [Model Context Protocol](https://modelcontextprotocol.io) server that
 exposes a single `execute_command` tool over the **Streamable HTTP** transport.
