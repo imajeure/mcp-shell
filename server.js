@@ -114,13 +114,30 @@ export function createMcpServer(allowedCommands = []) {
     ? "Allowlisted programs: " + allowedCommands.join(", ") + "."
     : "No commands are allowlisted; every command will be rejected until the operator configures MCP_SHELL_ALLOWED_COMMANDS.";
 
-  server.tool(
+  server.registerTool(
     "execute_command",
-    "Execute an allowlisted shell command on the host machine. Returns stdout, stderr, and exit code. " + allowList,
     {
-      command: z.string().min(1).max(10_000).describe("The shell command to execute"),
-      timeout_ms: z.number().int().min(1000).max(MAX_TIMEOUT_MS).optional()
-        .describe("Command timeout in milliseconds. Default: 30000 (30s). Max: 300000 (5min)."),
+      description:
+        "Execute a single allowlisted shell command on the host and return its stdout, stderr, and exit code as text. " +
+        "Use it to run one concrete, non-interactive command — inspect a file, query a CLI, read system state — " +
+        "not for interactive shells, background daemons, or chaining steps. " +
+        "Behavior: exactly one program runs (the first token of `command` must be allowlisted); shell control " +
+        "characters (; & | ` $ ( ) < > newlines) are rejected, so commands cannot be chained, piped, or redirected. " +
+        "Output above 100 KB is truncated, and the process is killed if it exceeds its timeout (default 30s, max 5min); " +
+        "a rejected or non-zero command returns with isError set and the reason in the text. " + allowList,
+      inputSchema: {
+        command: z.string().min(1).max(10_000)
+          .describe("A single shell command. Its first token must be an allowlisted program, and shell operators (; & | ` $ () <> newlines) are not allowed — submit one command per call."),
+        timeout_ms: z.number().int().min(1000).max(MAX_TIMEOUT_MS).optional()
+          .describe("Max milliseconds the command may run before it is killed. Default 30000 (30s), max 300000 (5min)."),
+      },
+      annotations: {
+        title: "Execute Shell Command",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
     },
     async ({ command, timeout_ms }) => {
       const verdict = checkAllowed(command, allowedCommands);

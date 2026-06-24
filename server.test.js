@@ -133,3 +133,18 @@ test("non-allowlisted command is rejected without executing", async () => {
     await client.close();
   }
 });
+
+test("execute_command advertises behavioral annotations over MCP", async () => {
+  const client = await authedClient();
+  try {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === "execute_command");
+    assert.ok(tool, "execute_command is listed");
+    assert.equal(tool.annotations?.title, "Execute Shell Command");
+    assert.equal(tool.annotations?.destructiveHint, true);
+    assert.equal(tool.annotations?.openWorldHint, true);
+    assert.equal(tool.annotations?.readOnlyHint, false);
+  } finally {
+    await client.close();
+  }
+});
