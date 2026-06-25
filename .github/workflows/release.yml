@@ -1,0 +1,43 @@
+name: Release
+
+# Publishes to npm when a GitHub Release is published. Authentication is npm
+# trusted publishing (OIDC) — no NPM_TOKEN secret. Configure the trusted
+# publisher on npmjs.com (package > Settings > Trusted Publisher) with this repo
+# and this workflow filename (release.yml) before the first release.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm trusted publishing + provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+      # Trusted publishing requires npm >= 11.5.1; ensure a capable CLI.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+      - name: Verify the release tag matches package.json
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          TAG="${{ github.event.release.tag_name }}"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::Release tag $TAG does not match package.json version $PKG"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm test
+      - name: Publish to npm (provenance via OIDC trusted publishing)
+        run: npm publish --provenance
