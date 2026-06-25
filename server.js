@@ -6,7 +6,7 @@
  * transport. The command runs directly in a subprocess of this server — there
  * is no separate gateway process and no stdio child.
  *
- * SECURITY — two independent layers, both mandatory by default:
+ * SECURITY — independent layers, all on by default:
  *   1. Bearer token (env MCP_SHELL_TOKEN). The server refuses to start without
  *      it; every HTTP request must present `Authorization: Bearer <token>` or
  *      gets 401 — checked before any MCP session handling.
@@ -14,6 +14,15 @@
  *      default => zero execution out of the box. A command runs only if its
  *      program is explicitly allowlisted, and commands containing shell control
  *      characters are rejected so the allowlist can't be bypassed by chaining.
+ *   3. Origin validation (env MCP_SHELL_ALLOWED_ORIGINS). DNS-rebinding
+ *      protection per the MCP spec: a request carrying a disallowed Origin
+ *      header gets 403, before authentication. Defaults to loopback origins;
+ *      requests with no Origin header (non-browser clients) are allowed.
+ *
+ * The executed command's environment is also scrubbed of this server's own
+ * secret + control variables (the token and allowlist above all, plus
+ * PORT/HOST/…), so an allowlisted command such as `env` cannot read the token.
+ * PATH, HOME, and all other variables pass through unchanged.
  *
  * These are app-layer defense-in-depth on top of (not instead of) running as a
  * least-privileged user, binding to 127.0.0.1, and network-layer access control.
@@ -23,6 +32,7 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -34,7 +44,12 @@ import {
   selfReport,
 } from "./smart-bridge.js";
 
-export const VERSION = "1.0.0";
+// Single source of version truth: the package manifest (always included in the
+// npm tarball), so the server can never report a version that has drifted from
+// what was published.
+const require = createRequire(import.meta.url);
+export const VERSION = require("./package.json").version;
+
 export const MAX_OUTPUT_BYTES = 100 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -46,6 +61,53 @@ const DEFAULT_SHELL = process.env.MCP_SHELL_BIN || "/bin/bash";
 // When an allowlist is in force these must be rejected, otherwise an allowlisted
 // program could be used as a springboard (e.g. `echo x; rm -rf /`).
 const SHELL_METACHARS = /[;&|`$(){}<>\n\r]/;
+
+// Server-owned environment variables that must never leak into an executed
+// command's environment: the bearer token and allowlist above all, plus the
+// process-control vars. Everything else (PATH, HOME, user-defined vars) passes
+// through so commands still resolve programs and behave normally.
+const CHILD_ENV_DENYLIST = new Set([
+  "MCP_SHELL_TOKEN",
+  "MCP_SHELL_ALLOWED_COMMANDS",
+  "MCP_SHELL_ALLOWED_ORIGINS",
+  "MCP_SHELL_BIN",
+  "NODE_ENV",
+  "PORT",
+  "HOST",
+  "MCP_ENDPOINT",
+  "ROUTE_PREFIX",
+]);
+
+// Returns a shallow copy of `base` (defaults to process.env) with the server's
+// own secret/control variables removed.
+export function buildChildEnv(base = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (!CHILD_ENV_DENYLIST.has(key)) env[key] = value;
+  }
+  return env;
+}
+
+// Origin allowlist for DNS-rebinding protection. The MCP spec requires servers
+// to validate the Origin header on incoming connections. Configurable via
+// MCP_SHELL_ALLOWED_ORIGINS (comma-separated); when unset, only loopback
+// origins are accepted.
+const DEFAULT_ALLOWED_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+export function parseAllowedOrigins(value) {
+  if (!value) return null; // null => fall back to the loopback default
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+// undefined Origin (a non-browser client) is allowed; the literal "null" opaque
+// origin is rejected; with an explicit allowlist the Origin must match exactly;
+// otherwise it must match the loopback default.
+export function isOriginAllowed(origin, allowlist) {
+  if (origin === undefined) return true;
+  if (origin === "null") return false;
+  if (allowlist) return allowlist.includes(origin);
+  return DEFAULT_ALLOWED_ORIGIN_RE.test(origin);
+}
 
 // The /healthz + /ready prefix is derived from the MCP endpoint (drop a trailing
 // /mcp) so health routes sit alongside the MCP endpoint. ROUTE_PREFIX overrides.
@@ -81,7 +143,7 @@ export function runCommand(command, timeoutMs) {
   return new Promise((resolve) => {
     exec(
       command,
-      { timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES * 2, shell: DEFAULT_SHELL, env: process.env },
+      { timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES * 2, shell: DEFAULT_SHELL, env: buildChildEnv() },
       (error, stdout, stderr) => {
         const exitCode = error ? (error.code ?? 1) : 0;
         const killed = error?.killed ?? false;
@@ -162,6 +224,7 @@ export function parseAllowedCommands(value) {
 export function createApp({
   token,
   allowedCommands = [],
+  allowedOrigins = null,
   mcpEndpoint = process.env.MCP_ENDPOINT || "/mcp",
   routePrefix = process.env.ROUTE_PREFIX,
 } = {}) {
@@ -180,6 +243,21 @@ export function createApp({
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Authorization");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    next();
+  });
+
+  // DNS-rebinding guard: validate the Origin header before authentication, so a
+  // rebinding attempt is refused before credentials are even consulted. CORS
+  // preflight is exempt; non-browser clients (no Origin header) pass through.
+  app.use((req, res, next) => {
+    if (req.method === "OPTIONS") return next();
+    if (!isOriginAllowed(req.headers["origin"], allowedOrigins)) {
+      return res.status(403).json({
+        jsonrpc: "2.0",
+        error: { code: -32003, message: "Forbidden: origin not allowed" },
+        id: null,
+      });
+    }
     next();
   });
 
@@ -270,6 +348,7 @@ export function createApp({
   app.locals.mcpEndpoint = MCP_ENDPOINT;
   app.locals.routePrefix = ROUTE_PREFIX;
   app.locals.allowedCommands = allowedCommands;
+  app.locals.allowedOrigins = allowedOrigins;
   return app;
 }
 
@@ -283,16 +362,18 @@ export function start() {
   if (allowedCommands.length === 0) {
     console.error("[mcp-shell] WARNING: MCP_SHELL_ALLOWED_COMMANDS is empty — default-deny is in effect, every command will be rejected.");
   }
+  const allowedOrigins = parseAllowedOrigins(process.env.MCP_SHELL_ALLOWED_ORIGINS);
 
   const PORT = parseInt(process.env.PORT || "3000", 10);
   const HOST = process.env.HOST || "127.0.0.1";
-  const app = createApp({ token, allowedCommands });
+  const app = createApp({ token, allowedCommands, allowedOrigins });
 
   const notifier = createNotifier({ selfReport });
 
   return app.listen(PORT, HOST, () => {
     console.error("[mcp-shell] v" + VERSION + " listening on " + HOST + ":" + PORT + app.locals.mcpEndpoint +
-      " (allowlist: " + (allowedCommands.join(", ") || "<empty — default-deny>") + ")");
+      " (allowlist: " + (allowedCommands.join(", ") || "<empty — default-deny>") +
+      "; origins: " + (allowedOrigins ? allowedOrigins.join(", ") : "<loopback default>") + ")");
     startWatchdog({ notifier, readyCheck, intervalMs: 15_000 });
   });
 }

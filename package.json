@@ -1,6 +1,6 @@
 {
   "name": "@imajeure/mcp-shell",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native Streamable HTTP MCP server exposing a single execute_command shell tool, with a /ready readiness probe and systemd watchdog support.",
   "type": "module",
   "main": "server.js",
@@ -29,7 +29,7 @@
   "license": "Apache-2.0",
   "author": "Imajeure, Inc. <oss@imajeure.com>",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -45,6 +45,7 @@
     "url": "https://github.com/imajeure/mcp-shell/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }
