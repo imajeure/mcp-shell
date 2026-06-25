@@ -1,6 +1,6 @@
 # mcp-shell
 
-[![CI](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml/badge.svg)](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@imajeure/mcp-shell.svg)](https://www.npmjs.com/package/@imajeure/mcp-shell) ![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg) ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
+[![CI](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml/badge.svg)](https://github.com/imajeure/mcp-shell/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@imajeure/mcp-shell.svg)](https://www.npmjs.com/package/@imajeure/mcp-shell) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/imajeure/mcp-shell/badge)](https://scorecard.dev/viewer/?uri=github.com/imajeure/mcp-shell) ![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg) ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 
 A native [Model Context Protocol](https://modelcontextprotocol.io) server that
 exposes a single `execute_command` tool over the **Streamable HTTP** transport.
@@ -10,9 +10,9 @@ gateway process and no stdio child.
 ## ⚠️ Security first
 
 `execute_command` is remote command execution by design. This server ships
-**locked down by default** with two independent, mandatory app-layer controls,
-which are meant to sit on top of (not replace) OS- and network-level hardening —
-defense in depth:
+**locked down by default** with three independent app-layer controls, which are
+meant to sit on top of (not replace) OS- and network-level hardening — defense
+in depth:
 
 **Layer 1 — Bearer token (required).**
 - Set `MCP_SHELL_TOKEN`. The server **refuses to start** without it.
@@ -27,6 +27,20 @@ defense in depth:
 - Commands containing shell control characters (`;`, `&`, `|`, `` ` ``, `$`,
   `()`, `<>`, …) are rejected, so an allowlisted program can't be used to chain
   into a non-allowlisted one.
+
+**Layer 3 — Origin validation (DNS-rebinding protection).**
+- Per the MCP specification, the `Origin` header is validated on every request.
+  A request carrying a disallowed `Origin` gets **403**, checked *before*
+  authentication.
+- Accepted origins default to loopback (`localhost` / `127.0.0.1` / `[::1]`);
+  override with `MCP_SHELL_ALLOWED_ORIGINS` (comma-separated).
+- Requests with **no** `Origin` header (non-browser clients — the normal case
+  for this server) pass through; the opaque `Origin: null` is rejected.
+
+The executed command's environment is also **scrubbed** of this server's own
+secret and control variables (`MCP_SHELL_TOKEN`, the allowlist, `PORT`, `HOST`,
+…), so an allowlisted command such as `env` can't read the bearer token. `PATH`,
+`HOME`, and unrelated variables pass through unchanged.
 
 **Operational hardening (your responsibility, and just as important).**
 - Run the server as a **dedicated least-privileged user**, never root.
@@ -72,8 +86,21 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:3000/mcp \
 # 401
 ```
 
-MCP clients must send the bearer token on every request (e.g. via the client
-transport's request headers: `Authorization: Bearer <MCP_SHELL_TOKEN>`).
+MCP clients must send the bearer token on every request. Clients that support
+the Streamable HTTP transport with custom headers connect with something like
+(exact key names vary by client):
+
+```json
+{
+  "mcpServers": {
+    "shell": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer <MCP_SHELL_TOKEN>" }
+    }
+  }
+}
+```
 
 ### Configuration (environment)
 
@@ -81,6 +108,7 @@ transport's request headers: `Authorization: Bearer <MCP_SHELL_TOKEN>`).
 |---|---|---|
 | `MCP_SHELL_TOKEN` | — (**required**) | Bearer token; server refuses to start if unset. |
 | `MCP_SHELL_ALLOWED_COMMANDS` | empty (deny all) | Comma-separated allowlisted program names. |
+| `MCP_SHELL_ALLOWED_ORIGINS` | loopback | Comma-separated allowed `Origin` values (DNS-rebinding guard). Unset accepts loopback origins only. |
 | `PORT` | `3000` | Port to listen on. |
 | `HOST` | `127.0.0.1` | Bind address. Keep it loopback unless something else gates access. |
 | `MCP_ENDPOINT` | `/mcp` | MCP Streamable HTTP mount path. |
@@ -94,7 +122,8 @@ transport's request headers: `Authorization: Bearer <MCP_SHELL_TOKEN>`).
 - `GET ${ROUTE_PREFIX}/ready` — readiness: spawns a throwaway shell and confirms
   a trivial command round-trips.
 
-All endpoints require the bearer token (CORS preflight `OPTIONS` excepted).
+All endpoints require the bearer token, and a request with a disallowed `Origin`
+is refused with **403** before auth (CORS preflight `OPTIONS` excepted).
 
 ## Testing
 
@@ -102,11 +131,12 @@ All endpoints require the bearer token (CORS preflight `OPTIONS` excepted).
 npm test   # node --test
 ```
 
-Unit tests cover the helpers and the default-deny allowlist (including the
-shell-metacharacter bypass guard). Integration tests boot the real server and,
-over the MCP Streamable HTTP client, prove: an allowlisted command runs, a
-non-allowlisted command is rejected without executing, and a request with no /
-invalid token gets **401**.
+Unit tests cover the helpers, the default-deny allowlist (including the
+shell-metacharacter bypass guard), `Origin` validation, and child-environment
+scrubbing. Integration tests boot the real server and, over the MCP Streamable
+HTTP client, prove: an allowlisted command runs, a non-allowlisted command is
+rejected without executing, a request with no / invalid token gets **401**, and
+a request with a disallowed `Origin` gets **403**.
 
 ## License
 
