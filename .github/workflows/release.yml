@@ -1,7 +1,7 @@
 name: Release
 
 # Publishes to npm when a GitHub Release is published. Authentication is npm
-# trusted publishing (OIDC) — no NPM_TOKEN secret. Configure the trusted
+# trusted publishing (OIDC) -- no NPM_TOKEN secret. Configure the trusted
 # publisher on npmjs.com (package > Settings > Trusted Publisher) with this repo
 # and this workflow filename (release.yml) before the first release.
 
@@ -20,8 +20,8 @@ jobs:
       contents: read
       id-token: write # OIDC for npm trusted publishing + provenance attestation
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
